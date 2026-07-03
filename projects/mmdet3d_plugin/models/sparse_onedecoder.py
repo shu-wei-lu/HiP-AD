@@ -267,6 +267,9 @@ class SparseOneDecoder(BaseModule):
             self.plan_anchor_encoder = build(plan_anchor_encoder, POSITIONAL_ENCODING)
             self.plan_deformable = nn.ModuleList([build(plan_deformable, ATTENTION) for _ in range(num_deform)])
             self.plan_refine = nn.ModuleList([build(plan_refine_layer, PLUGIN_LAYERS) for _ in range(num_refine)])
+            for refine_idx, refine_module in enumerate(self.plan_refine):
+                refine_module.hipad_refine_layer_index = refine_idx
+                refine_module.hipad_num_refine_layers = num_refine
             self.plan_decoder = build(plan_decoder, BBOX_CODERS)
             self.plan_sampler = build(plan_sampler, BBOX_SAMPLERS)
             self.align_sampler = build(align_sampler, BBOX_SAMPLERS)
@@ -1603,4 +1606,3 @@ class SparseOneDecoder(BaseModule):
                 ego_output, det_output, motion_output, plan_output, data)
 
         return det_result, map_result, ego_result, plan_result, motion_result
-

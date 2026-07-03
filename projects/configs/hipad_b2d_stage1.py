@@ -74,7 +74,7 @@ operation_order = single_frame_layer * num_single_frame_decoder + \
                   temporal_frame_layer * (num_decoder - num_single_frame_decoder)
 
 # anchors
-project_dir = "/opt/data/private/project/HiP-AD"
+project_dir = "/media/user/data1/shu_wei/hip-ad"
 
 anchor_paths = {
     "det" : f"{project_dir}/data/kmeans/b2d_det_900.npy",

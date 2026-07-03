@@ -1,6 +1,8 @@
+import os
 import torch
 import torch.nn as nn
 import numpy as np
+from pathlib import Path
 
 from mmcv.cnn import Linear, Scale, bias_init_with_prob
 from mmcv.runner.base_module import Sequential, BaseModule
@@ -12,6 +14,125 @@ from mmcv.cnn.bricks.registry import (
 from ..blocks import linear_relu_ln
 from projects.mmdet3d_plugin.models.utils import nerf_positional_encoding
 from functools import partial
+
+_HIPAD_ACTIVATION_INJECTOR = None
+_HIPAD_ACTIVATION_IMPORT_FAILED = False
+
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).lower() in ("1", "true", "t", "yes", "y")
+
+
+def _selected_plan_feature_layer(layer_index, num_layers):
+    target = int(os.environ.get("HIPAD_PLAN_FEATURE_LAYER", "-1"))
+    if target < 0:
+        target = num_layers + target
+    return layer_index == target
+
+
+def _save_hipad_plan_feature(name, feature, layer_index, num_layers):
+    if not _env_flag("SAVE_HIPAD_PLAN_FEATURES"):
+        return
+    if layer_index is None or num_layers is None:
+        return
+    if not _selected_plan_feature_layer(layer_index, num_layers):
+        return
+
+    root = os.environ.get("FUSED_FEATURES_PATH")
+    if root is None:
+        return
+    run_id = os.environ.get("HIPAD_PLAN_FEATURE_RUN_ID", "hipad")
+    frame = int(os.environ.get("HIPAD_PLAN_FEATURE_FRAME", "0"))
+    save_dir = Path(root) / run_id
+    save_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(feature.detach().cpu(), save_dir / f"{frame:06d}.pt")
+
+
+def _parse_activation_alpha():
+    value = os.environ.get("HIPAD_ACTIVATION_ALPHA")
+    if value is None or value == "":
+        return 0.0
+    if "," in value:
+        return [float(item.strip()) for item in value.split(",")]
+    return float(value)
+
+
+def _activation_layer_selected(layer_index, num_layers):
+    target_raw = os.environ.get("HIPAD_ACTIVATION_LAYER", os.environ.get("HIPAD_PLAN_FEATURE_LAYER", "-1"))
+    target = int(target_raw)
+    if target < 0:
+        target = num_layers + target
+    return layer_index == target
+
+
+def _selected_env_layer(name, layer_index, num_layers, default="-1"):
+    if layer_index is None or num_layers is None:
+        return False
+    target = int(os.environ.get(name, default))
+    if target < 0:
+        target = num_layers + target
+    return layer_index == target
+
+
+def _hipad_activation_injector():
+    global _HIPAD_ACTIVATION_INJECTOR, _HIPAD_ACTIVATION_IMPORT_FAILED
+    if _HIPAD_ACTIVATION_INJECTOR is not None or _HIPAD_ACTIVATION_IMPORT_FAILED:
+        return _HIPAD_ACTIVATION_INJECTOR
+    try:
+        from activation_steering.injector import ActivationInjector
+    except Exception as exc:
+        if _env_flag("ENABLE_ACTIVATION_STEERING") or _env_flag("ENABLE_ACTIVATION_INJECTOR"):
+            print(f"[HiP-AD ActivationInjector] import failed: {exc}", flush=True)
+        _HIPAD_ACTIVATION_IMPORT_FAILED = True
+        return None
+
+    default_vector = Path(os.environ.get("HIPAD_ACTIVATION_VECTOR_PATH", "steering_feats/brake_minus_normal.pt"))
+    _HIPAD_ACTIVATION_INJECTOR = ActivationInjector.from_env(default_vector)
+    return _HIPAD_ACTIVATION_INJECTOR
+
+
+def _apply_hipad_activation(feature, layer_index, num_layers):
+    if layer_index is None or num_layers is None:
+        return feature
+    if not _activation_layer_selected(layer_index, num_layers):
+        return feature
+    alpha = _parse_activation_alpha()
+    injector = _hipad_activation_injector()
+    if injector is None:
+        return feature
+    return injector.apply(feature, alpha=alpha)
+
+
+def _apply_sanity_spatial_residual_shift(reg_output, anchor_type, layer_index, num_layers, ego_fut_ts):
+    shift = float(os.environ.get("HIPAD_SANITY_RESIDUAL_SPAT_X_SHIFT", "0") or 0)
+    if shift == 0.0:
+        return reg_output
+    if anchor_type != ("spat", "2m"):
+        return reg_output
+    if not _selected_env_layer("HIPAD_SANITY_RESIDUAL_LAYER", layer_index, num_layers):
+        return reg_output
+    frame = int(os.environ.get("HIPAD_PLAN_FEATURE_FRAME", "0"))
+    start_frame = int(os.environ.get("HIPAD_SANITY_START_FRAME", "-1"))
+    end_frame = int(os.environ.get("HIPAD_SANITY_END_FRAME", "1000000000"))
+    if frame < start_frame or frame > end_frame:
+        return reg_output
+
+    shifted = reg_output.clone()
+    mode = os.environ.get("HIPAD_SANITY_RESIDUAL_X_MODE", "ramp").lower()
+    if mode == "constant":
+        shifted[..., 0::2] += shift
+    else:
+        shifted[..., 0::2] += shift / float(ego_fut_ts)
+    if _env_flag("HIPAD_SANITY_VERBOSE"):
+        print(
+            "[HiP-AD sanity] residual spatial x shift "
+            f"layer={layer_index}, final_shift={shift:.3f}, mode={mode}",
+            flush=True,
+        )
+    return shifted
 
 @PLUGIN_LAYERS.register_module()
 class SparsePlanRefinementModule(BaseModule):
@@ -61,6 +182,8 @@ class SparsePlanAlignRefinementModule(BaseModule):
 
         self.anchor_types = anchor_types
         self.anchor_group = len(anchor_types)
+        self.hipad_refine_layer_index = None
+        self.hipad_num_refine_layers = None
 
         self.plan_cls_branch = nn.Sequential(
             *linear_relu_ln(embed_dims, 1, 2),
@@ -123,6 +246,17 @@ class SparsePlanAlignRefinementModule(BaseModule):
                 raise NotImplementedError
 
         align_query = sum(align_query)
+        _save_hipad_plan_feature(
+            "align_query",
+            align_query,
+            self.hipad_refine_layer_index,
+            self.hipad_num_refine_layers,
+        )
+        align_query = _apply_hipad_activation(
+            align_query,
+            self.hipad_refine_layer_index,
+            self.hipad_num_refine_layers,
+        )
 
         if len(speed_query_dict):
             for speed_index in range(len(self.speed_areas)):
@@ -147,6 +281,13 @@ class SparsePlanAlignRefinementModule(BaseModule):
                 reg_output = reg_branch(speed_query)
                 cls_output = self.plan_cls_branch_speed(speed_query)
 
+            reg_output = _apply_sanity_spatial_residual_shift(
+                reg_output,
+                anchor_type,
+                self.hipad_refine_layer_index,
+                self.hipad_num_refine_layers,
+                self.ego_fut_ts,
+            )
             cls_outputs.append(cls_output)
             reg_outputs.append(reg_output)
 

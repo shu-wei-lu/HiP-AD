@@ -196,6 +196,7 @@ class SparsePlanDecoder(object):
         # step2. select modality
         mode_idx = self.anchor_types.index(self.anchor_refer)
         mode_idx = cls_preds[mode_idx].argmax(dim=-1)
+
         for i, anchor_type in enumerate(self.anchor_types):
             cls_preds[i] = cls_preds[i][bs_indices, mode_idx]
             reg_preds[i] = reg_preds[i][bs_indices, mode_idx]

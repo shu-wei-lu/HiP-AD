@@ -572,6 +572,11 @@ class SparseAgent(autonomous_agent.AutonomousAgent):
         pred_spat_traj = None
         if plan_spat_name in outputs[0]['img_bbox']:
             pred_spat_traj = outputs[0]['img_bbox'][plan_spat_name].cpu().numpy()
+            pred_spat_traj = self._apply_sanity_spatial_shift(pred_spat_traj)
+            outputs[0]['img_bbox'][plan_spat_name] = torch.as_tensor(
+                pred_spat_traj,
+                dtype=outputs[0]['img_bbox'][plan_spat_name].dtype,
+                device=outputs[0]['img_bbox'][plan_spat_name].device)
             outputs[0]['img_bbox']['spatial_planning'] = outputs[0]['img_bbox'][plan_spat_name]
 
         steer_traj, throttle_traj, brake_traj, metadata_traj = self.pidcontroller.control_pid(
@@ -613,6 +618,41 @@ class SparseAgent(autonomous_agent.AutonomousAgent):
             self.prev_control_cache.pop(0)
         self.prev_control_cache.append(control)
         return control
+
+    def _apply_sanity_spatial_shift(self, pred_spat_traj):
+        manual_shift = float(os.environ.get('HIPAD_SANITY_SPATIAL_X_SHIFT', '0') or 0)
+        shift = manual_shift
+        shift_source = 'sanity'
+        if shift == 0.0:
+            shift = float(os.environ.get('HIPAD_ACTIVATION_PLAN_SHIFT', '0') or 0)
+            shift_source = 'activation'
+        if shift == 0.0 or pred_spat_traj is None:
+            return pred_spat_traj
+        if shift_source == 'sanity':
+            frame = int(getattr(self, 'step', 0))
+            start_frame = int(os.environ.get('HIPAD_SANITY_START_FRAME', '-1'))
+            end_frame = int(os.environ.get('HIPAD_SANITY_END_FRAME', '1000000000'))
+            if frame < start_frame or frame > end_frame:
+                return pred_spat_traj
+
+        pred_spat_traj = pred_spat_traj.copy()
+        mode = os.environ.get('HIPAD_SANITY_SPATIAL_X_MODE', 'ramp').lower()
+        if mode == 'constant':
+            offsets = np.full((pred_spat_traj.shape[0],), shift, dtype=pred_spat_traj.dtype)
+        else:
+            offsets = np.linspace(
+                shift / pred_spat_traj.shape[0],
+                shift,
+                pred_spat_traj.shape[0],
+                dtype=pred_spat_traj.dtype)
+        pred_spat_traj[:, 0] += offsets
+        if os.environ.get('HIPAD_SANITY_VERBOSE', '0') in ('1', 'true', 'True'):
+            print(
+                f'[HiP-AD {shift_source}] shifted final spatial x by '
+                f'{shift:.3f}; first_x={pred_spat_traj[0, 0]:.3f}, '
+                f'last_x={pred_spat_traj[-1, 0]:.3f}',
+                flush=True)
+        return pred_spat_traj
 
     def visualize(self, tick_data, input_batch, output_batch, pred_planning, target_point):
         rw, rh = 960//2, 540//2
