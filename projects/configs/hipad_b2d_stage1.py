@@ -1,3 +1,5 @@
+import os
+
 log_level = "INFO"
 dist_params = dict(backend="nccl")
 
@@ -74,7 +76,7 @@ operation_order = single_frame_layer * num_single_frame_decoder + \
                   temporal_frame_layer * (num_decoder - num_single_frame_decoder)
 
 # anchors
-project_dir = "/media/user/data1/shu_wei/hip-ad"
+project_dir = os.environ["HIP"]
 
 anchor_paths = {
     "det" : f"{project_dir}/data/kmeans/b2d_det_900.npy",

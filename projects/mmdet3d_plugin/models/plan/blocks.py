@@ -95,10 +95,10 @@ def _hipad_activation_injector():
 
 
 def _apply_hipad_activation(feature, layer_index, num_layers):
-    if layer_index is None or num_layers is None:
-        return feature
-    if not _activation_layer_selected(layer_index, num_layers):
-        return feature
+    # if layer_index is None or num_layers is None:
+    #     return feature
+    # if not _activation_layer_selected(layer_index, num_layers):
+    #     return feature
     alpha = _parse_activation_alpha()
     injector = _hipad_activation_injector()
     if injector is None:
