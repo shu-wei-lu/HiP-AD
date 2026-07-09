@@ -316,7 +316,7 @@ class SparseAgent(autonomous_agent.AutonomousAgent):
         self.prev_control_cache = []
 
         self.is_visualize = True
-        self.visualize_interval = 2
+        self.visualize_interval = 1
 
         if self.is_visualize:
             string = pathlib.Path(os.environ['ROUTES']).stem + '_'
@@ -567,6 +567,11 @@ class SparseAgent(autonomous_agent.AutonomousAgent):
         pred_temp_traj = None
         if plan_temp_name in outputs[0]['img_bbox']:
             pred_temp_traj = outputs[0]['img_bbox'][plan_temp_name].cpu().numpy()
+            pred_temp_traj = self._apply_sanity_temp_shift(pred_temp_traj)
+            outputs[0]['img_bbox'][plan_temp_name] = torch.as_tensor(
+                pred_temp_traj,
+                dtype=outputs[0]['img_bbox'][plan_temp_name].dtype,
+                device=outputs[0]['img_bbox'][plan_temp_name].device)
             outputs[0]['img_bbox']['temporal_planning'] = outputs[0]['img_bbox'][plan_temp_name]
 
         pred_spat_traj = None
@@ -620,39 +625,58 @@ class SparseAgent(autonomous_agent.AutonomousAgent):
         return control
 
     def _apply_sanity_spatial_shift(self, pred_spat_traj):
-        manual_shift = float(os.environ.get('HIPAD_SANITY_SPATIAL_X_SHIFT', '0') or 0)
-        shift = manual_shift
-        shift_source = 'sanity'
-        if shift == 0.0:
-            shift = float(os.environ.get('HIPAD_ACTIVATION_PLAN_SHIFT', '0') or 0)
+        return self._apply_sanity_plan_x_shift(
+            pred_spat_traj,
+            manual_shift_env='HIPAD_SANITY_SPATIAL_X_SHIFT',
+            mode_env='HIPAD_SANITY_SPATIAL_X_MODE',
+            label='spatial',
+        )
+
+    def _apply_sanity_temp_shift(self, pred_temp_traj):
+        return self._apply_sanity_plan_x_shift(
+            pred_temp_traj,
+            manual_shift_env='HIPAD_SANITY_TEMP_X_SHIFT',
+            mode_env='HIPAD_SANITY_TEMP_X_MODE',
+            label='temporal',
+        )
+
+    def _apply_sanity_plan_x_shift(self, pred_traj, manual_shift_env, mode_env, label):
+        manual_shift_raw = os.environ.get(manual_shift_env)
+        manual_shift = float(manual_shift_raw or 0)
+        activation_shift = float(os.environ.get('HIPAD_ACTIVATION_PLAN_SHIFT', '0') or 0)
+        if activation_shift != 0.0:
+            shift = activation_shift
             shift_source = 'activation'
-        if shift == 0.0 or pred_spat_traj is None:
-            return pred_spat_traj
+        else:
+            shift = manual_shift
+            shift_source = 'sanity'
+        if shift == 0.0 or pred_traj is None:
+            return pred_traj
         if shift_source == 'sanity':
             frame = int(getattr(self, 'step', 0))
             start_frame = int(os.environ.get('HIPAD_SANITY_START_FRAME', '-1'))
             end_frame = int(os.environ.get('HIPAD_SANITY_END_FRAME', '1000000000'))
             if frame < start_frame or frame > end_frame:
-                return pred_spat_traj
+                return pred_traj
 
-        pred_spat_traj = pred_spat_traj.copy()
-        mode = os.environ.get('HIPAD_SANITY_SPATIAL_X_MODE', 'ramp').lower()
+        pred_traj = pred_traj.copy()
+        mode = os.environ.get(mode_env, os.environ.get('HIPAD_SANITY_SPATIAL_X_MODE', 'ramp')).lower()
         if mode == 'constant':
-            offsets = np.full((pred_spat_traj.shape[0],), shift, dtype=pred_spat_traj.dtype)
+            offsets = np.full((pred_traj.shape[0],), shift, dtype=pred_traj.dtype)
         else:
             offsets = np.linspace(
-                shift / pred_spat_traj.shape[0],
+                shift / pred_traj.shape[0],
                 shift,
-                pred_spat_traj.shape[0],
-                dtype=pred_spat_traj.dtype)
-        pred_spat_traj[:, 0] += offsets
+                pred_traj.shape[0],
+                dtype=pred_traj.dtype)
+        pred_traj[:, 0] += offsets
         if os.environ.get('HIPAD_SANITY_VERBOSE', '0') in ('1', 'true', 'True'):
             print(
-                f'[HiP-AD {shift_source}] shifted final spatial x by '
-                f'{shift:.3f}; first_x={pred_spat_traj[0, 0]:.3f}, '
-                f'last_x={pred_spat_traj[-1, 0]:.3f}',
+                f'[HiP-AD {shift_source}] shifted final {label} x by '
+                f'{shift:.3f}; first_x={pred_traj[0, 0]:.3f}, '
+                f'last_x={pred_traj[-1, 0]:.3f}',
                 flush=True)
-        return pred_spat_traj
+        return pred_traj
 
     def visualize(self, tick_data, input_batch, output_batch, pred_planning, target_point):
         rw, rh = 960//2, 540//2

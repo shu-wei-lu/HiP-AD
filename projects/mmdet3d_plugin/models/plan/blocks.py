@@ -17,6 +17,10 @@ from functools import partial
 
 _HIPAD_ACTIVATION_INJECTOR = None
 _HIPAD_ACTIVATION_IMPORT_FAILED = False
+# Edit these module parameters to choose where HiP-AD activation steering is applied.
+# Layers support "-1", "0,2,-1", or "all"; features support one or more saved feature names.
+_HIPAD_ACTIVATION_LAYER = "all"
+_HIPAD_ACTIVATION_features = "pre_instance_feature" # pre_instance_feature instance_feature_with_anchor_embed align_query
 
 
 def _env_flag(name, default=False):
@@ -27,10 +31,34 @@ def _env_flag(name, default=False):
 
 
 def _selected_plan_feature_layer(layer_index, num_layers):
-    target = int(os.environ.get("HIPAD_PLAN_FEATURE_LAYER", "-1"))
-    if target < 0:
-        target = num_layers + target
-    return layer_index == target
+    layers = os.environ.get("HIPAD_PLAN_FEATURE_LAYERS")
+    if layers is None:
+        legacy_layer = os.environ.get("HIPAD_PLAN_FEATURE_LAYER")
+        if legacy_layer is None:
+            return True
+        layers = legacy_layer
+
+    layers = layers.strip().lower()
+    if layers in ("", "all", "*"):
+        return True
+
+    for item in layers.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        target = int(item)
+        if target < 0:
+            target = num_layers + target
+        if layer_index == target:
+            return True
+    return False
+
+
+def _selected_plan_feature_name(name):
+    names = os.environ.get("HIPAD_PLAN_FEATURE_NAMES")
+    if names is None or names.strip().lower() in ("", "all", "*"):
+        return True
+    return name in {item.strip() for item in names.split(",") if item.strip()}
 
 
 def _save_hipad_plan_feature(name, feature, layer_index, num_layers):
@@ -40,13 +68,15 @@ def _save_hipad_plan_feature(name, feature, layer_index, num_layers):
         return
     if not _selected_plan_feature_layer(layer_index, num_layers):
         return
+    if not _selected_plan_feature_name(name):
+        return
 
     root = os.environ.get("FUSED_FEATURES_PATH")
     if root is None:
         return
     run_id = os.environ.get("HIPAD_PLAN_FEATURE_RUN_ID", "hipad")
     frame = int(os.environ.get("HIPAD_PLAN_FEATURE_FRAME", "0"))
-    save_dir = Path(root) / run_id
+    save_dir = Path(root) / run_id / name / f"layer_{layer_index:02d}"
     save_dir.mkdir(parents=True, exist_ok=True)
     torch.save(feature.detach().cpu(), save_dir / f"{frame:06d}.pt")
 
@@ -61,11 +91,38 @@ def _parse_activation_alpha():
 
 
 def _activation_layer_selected(layer_index, num_layers):
-    target_raw = os.environ.get("HIPAD_ACTIVATION_LAYER", os.environ.get("HIPAD_PLAN_FEATURE_LAYER", "-1"))
-    target = int(target_raw)
-    if target < 0:
-        target = num_layers + target
-    return layer_index == target
+    if layer_index is None or num_layers is None:
+        return False
+    layers = os.environ.get(
+        "HIPAD_ACTIVATION_LAYER",
+        os.environ.get("HIPAD_PLAN_FEATURE_LAYER", _HIPAD_ACTIVATION_LAYER),
+    )
+    layers = str(layers).strip().lower()
+    if layers in ("", "all", "*"):
+        return True
+
+    for item in layers.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        target = int(item)
+        if target < 0:
+            target = num_layers + target
+        if layer_index == target:
+            return True
+    return False
+
+
+def _activation_feature_selected(name):
+    features = _HIPAD_ACTIVATION_features
+    if isinstance(features, str):
+        features = features.strip()
+        if features.lower() in ("", "all", "*"):
+            return True
+        return name in {item.strip() for item in features.split(",") if item.strip()}
+    if features is None:
+        return False
+    return name in set(features)
 
 
 def _selected_env_layer(name, layer_index, num_layers, default="-1"):
@@ -94,11 +151,11 @@ def _hipad_activation_injector():
     return _HIPAD_ACTIVATION_INJECTOR
 
 
-def _apply_hipad_activation(feature, layer_index, num_layers):
-    # if layer_index is None or num_layers is None:
-    #     return feature
-    # if not _activation_layer_selected(layer_index, num_layers):
-    #     return feature
+def _apply_hipad_activation(name, feature, layer_index, num_layers):
+    if not _activation_layer_selected(layer_index, num_layers):
+        return feature
+    if not _activation_feature_selected(name):
+        return feature
     alpha = _parse_activation_alpha()
     injector = _hipad_activation_injector()
     if injector is None:
@@ -227,8 +284,32 @@ class SparsePlanAlignRefinementModule(BaseModule):
             nn.init.constant_(self.plan_cls_branch_speed[-1].bias, bias_init)
 
     def forward(self, instance_feature, anchor, anchor_embed, use_plan_anchor_embed=True):
+        _save_hipad_plan_feature(
+            "pre_instance_feature",
+            instance_feature,
+            self.hipad_refine_layer_index,
+            self.hipad_num_refine_layers,
+        )
+        instance_feature = _apply_hipad_activation(
+            "pre_instance_feature",
+            instance_feature,
+            self.hipad_refine_layer_index,
+            self.hipad_num_refine_layers,
+        )
         if use_plan_anchor_embed:
             instance_feature = instance_feature + anchor_embed
+        _save_hipad_plan_feature(
+            "instance_feature_with_anchor_embed",
+            instance_feature,
+            self.hipad_refine_layer_index,
+            self.hipad_num_refine_layers,
+        )
+        instance_feature = _apply_hipad_activation(
+            "instance_feature_with_anchor_embed",
+            instance_feature,
+            self.hipad_refine_layer_index,
+            self.hipad_num_refine_layers,
+        )
 
         instance_features = torch.stack(instance_feature.chunk(self.anchor_group, dim=1))
 
@@ -253,6 +334,7 @@ class SparsePlanAlignRefinementModule(BaseModule):
             self.hipad_num_refine_layers,
         )
         align_query = _apply_hipad_activation(
+            "align_query",
             align_query,
             self.hipad_refine_layer_index,
             self.hipad_num_refine_layers,
