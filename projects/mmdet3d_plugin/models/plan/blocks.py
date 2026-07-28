@@ -20,7 +20,7 @@ _HIPAD_ACTIVATION_IMPORT_FAILED = False
 # Edit these module parameters to choose where HiP-AD activation steering is applied.
 # Layers support "-1", "0,2,-1", or "all"; features support one or more saved feature names.
 _HIPAD_ACTIVATION_LAYER = "all"
-_HIPAD_ACTIVATION_features = "pre_instance_feature" # pre_instance_feature instance_feature_with_anchor_embed align_query
+_HIPAD_ACTIVATION_features = "align_query" # pre_instance_feature instance_feature_with_anchor_embed align_query
 
 
 def _env_flag(name, default=False):
@@ -125,15 +125,6 @@ def _activation_feature_selected(name):
     return name in set(features)
 
 
-def _selected_env_layer(name, layer_index, num_layers, default="-1"):
-    if layer_index is None or num_layers is None:
-        return False
-    target = int(os.environ.get(name, default))
-    if target < 0:
-        target = num_layers + target
-    return layer_index == target
-
-
 def _hipad_activation_injector():
     global _HIPAD_ACTIVATION_INJECTOR, _HIPAD_ACTIVATION_IMPORT_FAILED
     if _HIPAD_ACTIVATION_INJECTOR is not None or _HIPAD_ACTIVATION_IMPORT_FAILED:
@@ -160,36 +151,231 @@ def _apply_hipad_activation(name, feature, layer_index, num_layers):
     injector = _hipad_activation_injector()
     if injector is None:
         return feature
-    return injector.apply(feature, alpha=alpha)
+
+    cosine_gate_enabled = _env_flag("HIPAD_ACTIVATION_COSINE_GATE", True)
+    cosine_gate_low = float(os.environ.get("HIPAD_ACTIVATION_COSINE_GATE_LOW", "0.30"))
+    cosine_gate_high = float(os.environ.get("HIPAD_ACTIVATION_COSINE_GATE_HIGH", "0.60"))
+    if cosine_gate_high <= cosine_gate_low:
+        raise ValueError(
+            "HIPAD_ACTIVATION_COSINE_GATE_HIGH must be greater than "
+            "HIPAD_ACTIVATION_COSINE_GATE_LOW."
+        )
+
+    # The rank-3 call is the original align_query hook. It is reached once at
+    # layer 0 before the rank-4 speed-bin hook, so it marks the start of a new
+    # planner forward/frame and invalidates the previous frame's gates.
+    if layer_index == 0 and name == "align_query" and feature.ndim == 3:
+        injector._hipad_layer0_cosine_gates = {}
+
+    def matches_hook(vector):
+        # Reject broadcasting that would expand the feature itself. For
+        # example, [1, 3, 48, 256] + [1, 48, 256] must not silently turn the
+        # align query into [1, 3, 48, 256].
+        return (
+            vector.ndim == feature.ndim
+            and all(vector_size in (1, feature_size)
+                    for vector_size, feature_size in zip(vector.shape, feature.shape))
+        )
+
+    def layer0_cosine_gate(vector, cache_key):
+        # Brake v5 is rank 4 [B, stop/slow/fast, modes, dims]. The adaptive
+        # gate is intentionally limited to rank-3 left/right align vectors.
+        if not cosine_gate_enabled or vector.ndim != 3:
+            return 1.0
+
+        gates = getattr(injector, "_hipad_layer0_cosine_gates", {})
+        if layer_index == 0:
+            reference_vector = vector
+            if reference_vector.shape[0] == 1 and feature.shape[0] != 1:
+                reference_vector = reference_vector.expand(
+                    feature.shape[0], *reference_vector.shape[1:])
+            feature_flat = feature.detach().float().reshape(feature.shape[0], -1)
+            vector_flat = reference_vector.detach().float().reshape(reference_vector.shape[0], -1)
+            similarity = torch.nn.functional.cosine_similarity(
+                feature_flat,
+                vector_flat,
+                dim=1,
+                eps=1e-8,
+            )
+            gate = ((cosine_gate_high - similarity) /
+                    (cosine_gate_high - cosine_gate_low)).clamp(0.0, 1.0)
+            gate = gate.to(device=feature.device, dtype=feature.dtype)
+            gate = gate.reshape(feature.shape[0], *([1] * (feature.ndim - 1)))
+            gates[cache_key] = gate
+            injector._hipad_layer0_cosine_gates = gates
+            if _env_flag("HIPAD_ACTIVATION_COSINE_GATE_VERBOSE"):
+                print(
+                    "[HiP-AD cosine gate] "
+                    f"key={cache_key}, "
+                    f"similarity={similarity.detach().cpu().tolist()}, "
+                    f"gate={gate.detach().cpu().flatten().tolist()}",
+                    flush=True,
+                )
+        return gates.get(cache_key, 1.0)
+
+    # Route a legacy per-query vector to the original align-query hook and a
+    # speed-bin-specific vector to the stacked speed-query hook. Both hooks
+    # use the saved feature name "align_query", so shape compatibility keeps
+    # the routing generic without action-specific branching.
+    if injector.vector_path is not None:
+        vector = injector.vector(
+            feature,
+            layer_index=layer_index,
+            num_layers=num_layers,
+        )
+        if not matches_hook(vector):
+            return feature
+        if vector.ndim == 3 and cosine_gate_enabled:
+            alpha_values = torch.as_tensor(
+                alpha,
+                device=feature.device,
+                dtype=feature.dtype,
+            ).flatten()
+            if alpha_values.numel() != 1:
+                raise ValueError(
+                    "A single ACTIVATION_VECTOR_PATH requires a scalar "
+                    "HIPAD_ACTIVATION_ALPHA when cosine gating is enabled."
+                )
+            gate = layer0_cosine_gate(vector, f"single:{injector.vector_path}")
+            return feature + alpha_values[0] * gate * vector
+
+    elif injector.vector_paths is not None:
+        alpha_vector = injector.alpha_vector(alpha).to(
+            device=feature.device,
+            dtype=feature.dtype,
+        )
+        alpha_scales = torch.as_tensor(
+            injector.action_alpha_scales,
+            device=feature.device,
+            dtype=feature.dtype,
+        )
+        vectors = injector.action_vectors(
+            feature,
+            layer_index=layer_index,
+            num_layers=num_layers,
+        )
+        result = feature
+        for action_index, (action_alpha, vector) in enumerate(
+                zip(alpha_vector * alpha_scales, vectors)):
+            if vector is None or float(action_alpha.detach().cpu()) == 0.0:
+                continue
+            if matches_hook(vector):
+                gate = layer0_cosine_gate(
+                    vector,
+                    f"action:{action_index}:{injector.vector_paths[action_index]}",
+                )
+                result = result + action_alpha * gate * vector
+        return result
+
+    result = injector.apply(
+        feature,
+        alpha=alpha,
+        layer_index=layer_index,
+        num_layers=num_layers,
+    )
+    if result.shape != feature.shape:
+        raise RuntimeError(
+            "HiP-AD activation steering changed the feature shape from "
+            f"{tuple(feature.shape)} to {tuple(result.shape)}."
+        )
+    return result
 
 
-def _apply_sanity_spatial_residual_shift(reg_output, anchor_type, layer_index, num_layers, ego_fut_ts):
-    shift = float(os.environ.get("HIPAD_SANITY_RESIDUAL_SPAT_X_SHIFT", "0") or 0)
-    if shift == 0.0:
-        return reg_output
-    if anchor_type != ("spat", "2m"):
-        return reg_output
-    if not _selected_env_layer("HIPAD_SANITY_RESIDUAL_LAYER", layer_index, num_layers):
-        return reg_output
-    frame = int(os.environ.get("HIPAD_PLAN_FEATURE_FRAME", "0"))
-    start_frame = int(os.environ.get("HIPAD_SANITY_START_FRAME", "-1"))
-    end_frame = int(os.environ.get("HIPAD_SANITY_END_FRAME", "1000000000"))
-    if frame < start_frame or frame > end_frame:
-        return reg_output
+def _hipad_brake_activation_active(reference, layer_index, num_layers):
+    """Return whether the current policy is applying the brake activation."""
+    injector = _hipad_activation_injector()
+    if injector is None:
+        return False
 
-    shifted = reg_output.clone()
-    mode = os.environ.get("HIPAD_SANITY_RESIDUAL_X_MODE", "ramp").lower()
-    if mode == "constant":
-        shifted[..., 0::2] += shift
-    else:
-        shifted[..., 0::2] += shift / float(ego_fut_ts)
-    if _env_flag("HIPAD_SANITY_VERBOSE"):
+    alpha = _parse_activation_alpha()
+    if injector.vector_paths is not None:
+        if not injector.vector_paths or injector.vector_paths[0] is None:
+            return False
+        alpha_vector = injector.alpha_vector(alpha)
+        effective_brake_alpha = (
+            alpha_vector[0] * float(injector.action_alpha_scales[0])
+        )
+        return float(effective_brake_alpha) > 0.0
+
+    if injector.vector_path is None:
+        return False
+
+    alpha_values = torch.as_tensor(alpha).detach().cpu().flatten().float()
+    if alpha_values.numel() != 1 or float(alpha_values[0]) <= 0.0:
+        return False
+
+    # A single rank-4 vector is the fused [stop, slow, fast] brake vector.
+    vector = injector.vector(
+        reference,
+        layer_index=layer_index,
+        num_layers=num_layers,
+    )
+    return vector.ndim == 4
+
+
+def _cap_hipad_brake_stop_regression(
+        reg_outputs,
+        anchor_types,
+        anchor_group,
+        ego_fut_ts,
+        layer_index,
+        num_layers,
+):
+    """Cap final-layer 5 Hz stop trajectories while brake steering is active."""
+    if not _env_flag("HIPAD_BRAKE_REG_CAP", True):
+        return reg_outputs
+    if layer_index is None or num_layers is None or layer_index != num_layers - 1:
+        return reg_outputs
+    if not _hipad_brake_activation_active(reg_outputs, layer_index, num_layers):
+        return reg_outputs
+
+    stop_group = ("speed", "5hz", (0, 0.4))
+    if stop_group not in anchor_types:
+        return reg_outputs
+
+    target_speed = float(os.environ.get("HIPAD_BRAKE_REG_TARGET_SPEED", "0.25"))
+    if target_speed < 0.0:
+        raise ValueError("HIPAD_BRAKE_REG_TARGET_SPEED must be non-negative.")
+
+    batch_size = reg_outputs.shape[0]
+    grouped = reg_outputs.reshape(
+        batch_size,
+        anchor_group,
+        -1,
+        ego_fut_ts,
+        2,
+    ).clone()
+    stop_index = anchor_types.index(stop_group)
+    stop_traj = grouped[:, stop_index]
+    stop_deltas = stop_traj[..., 1:, :] - stop_traj[..., :-1, :]
+    desired_speed = (
+        torch.linalg.vector_norm(stop_deltas.float(), dim=-1).mean(dim=-1)
+        / 0.2
+    )
+    scale = (
+        target_speed / desired_speed.clamp_min(1e-6)
+    ).clamp(max=1.0)
+    grouped[:, stop_index] = stop_traj * scale.to(
+        dtype=stop_traj.dtype,
+    )[..., None, None]
+
+    if _env_flag("HIPAD_BRAKE_REG_CAP_VERBOSE"):
         print(
-            "[HiP-AD sanity] residual spatial x shift "
-            f"layer={layer_index}, final_shift={shift:.3f}, mode={mode}",
+            "[HiP-AD brake reg cap] "
+            f"target_speed={target_speed:.3f}, "
+            f"desired_speed_before="
+            f"(min={float(desired_speed.min()):.3f}, "
+            f"mean={float(desired_speed.mean()):.3f}, "
+            f"max={float(desired_speed.max()):.3f}), "
+            f"scale="
+            f"(min={float(scale.min()):.3f}, "
+            f"mean={float(scale.mean()):.3f}, "
+            f"max={float(scale.max()):.3f})",
             flush=True,
         )
-    return shifted
+
+    return grouped.reshape(batch_size, -1, ego_fut_ts * 2)
+
 
 @PLUGIN_LAYERS.register_module()
 class SparsePlanRefinementModule(BaseModule):
@@ -341,11 +527,27 @@ class SparsePlanAlignRefinementModule(BaseModule):
         )
 
         if len(speed_query_dict):
+            speed_queries = []
             for speed_index in range(len(self.speed_areas)):
                 speed_query = []
                 for freq in speed_query_dict.keys():
                     speed_query.append(speed_query_dict[freq][speed_index])
-                speed_query = sum(speed_query)
+                speed_queries.append(sum(speed_query))
+
+            # [B, num_speed_bins, num_modes, embed_dims]. Only a matching
+            # bin-specific [1, num_speed_bins, num_modes, embed_dims] vector
+            # is routed here; legacy [1, num_modes, embed_dims] vectors have
+            # already been applied to align_query above.
+            speed_queries = torch.stack(speed_queries, dim=1)
+            speed_queries = _apply_hipad_activation(
+                "align_query",
+                speed_queries,
+                self.hipad_refine_layer_index,
+                self.hipad_num_refine_layers,
+            )
+
+            for speed_index in range(len(self.speed_areas)):
+                speed_query = speed_queries[:, speed_index]
                 for freq in speed_query_dict.keys():
                     speed_query_dict[freq][speed_index] = align_query + speed_query
 
@@ -363,13 +565,6 @@ class SparsePlanAlignRefinementModule(BaseModule):
                 reg_output = reg_branch(speed_query)
                 cls_output = self.plan_cls_branch_speed(speed_query)
 
-            reg_output = _apply_sanity_spatial_residual_shift(
-                reg_output,
-                anchor_type,
-                self.hipad_refine_layer_index,
-                self.hipad_num_refine_layers,
-                self.ego_fut_ts,
-            )
             cls_outputs.append(cls_output)
             reg_outputs.append(reg_output)
 
@@ -377,5 +572,13 @@ class SparsePlanAlignRefinementModule(BaseModule):
         reg_outputs = torch.cat(reg_outputs, dim=1)
 
         reg_outputs = reg_outputs + anchor
+        reg_outputs = _cap_hipad_brake_stop_regression(
+            reg_outputs,
+            self.anchor_types,
+            self.anchor_group,
+            self.ego_fut_ts,
+            self.hipad_refine_layer_index,
+            self.hipad_num_refine_layers,
+        )
 
         return reg_outputs, cls_outputs

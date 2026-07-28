@@ -146,6 +146,7 @@ class SparsePlanDecoder(object):
                     speed_reg_preds = speed_dict[speed_type]["reg_preds"]
 
                     speed_idx = torch.argmax(speed_cls_preds)
+
                     if self.adapt_status:
                         status_idx = -1
                         ego_speed = ego_output['status'][-1][i, 0, 0].item()
@@ -154,6 +155,52 @@ class SparsePlanDecoder(object):
                                 status_idx = idx
                         if status_idx != -1:
                             speed_idx = status_idx
+                    # if speed_type == "5hz":
+                    #     speed_idx_int = int(speed_idx.item())
+                    #     speed_scores = (
+                    #         speed_cls_preds
+                    #         .detach()
+                    #         .float()
+                    #         .cpu()
+                    #         .reshape(-1)
+                    #         .tolist()
+                    #     )
+                    #     selected_area = speed_dict[speed_type]["speed_areas"][
+                    #         speed_idx_int
+                    #     ]
+                    #     speed_reg_deltas = (
+                    #         speed_reg_preds[:, 1:] - speed_reg_preds[:, :-1]
+                    #     )
+                    #     reg_desired_speeds = (
+                    #         torch.linalg.vector_norm(
+                    #             speed_reg_deltas,
+                    #             dim=-1,
+                    #         ).mean(dim=-1)
+                    #         / 0.2
+                    #     )
+                    #     reg_desired_speed_values = (
+                    #         reg_desired_speeds
+                    #         .detach()
+                    #         .float()
+                    #         .cpu()
+                    #         .reshape(-1)
+                    #         .tolist()
+                    #     )
+                    #     selected_reg_desired_speed = (
+                    #         reg_desired_speed_values[speed_idx_int]
+                    #     )
+
+                    #     print(
+                    #         f"[HiP-AD speed selection] "
+                    #         f"type={speed_type}, "
+                    #         f"scores={speed_scores}, "
+                    #         f"reg_desired_speeds={reg_desired_speed_values}, "
+                    #         f"selected_index={speed_idx_int}, "
+                    #         f"selected_area={selected_area}, "
+                    #         f"selected_reg_desired_speed="
+                    #         f"{selected_reg_desired_speed}",
+                    #         flush=True,
+                    #     )
 
                     output["plan_speed_{}".format(speed_type)] = speed_reg_preds[speed_idx].cpu()
 
