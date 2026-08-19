@@ -152,13 +152,13 @@ def _apply_hipad_activation(name, feature, layer_index, num_layers):
     if injector is None:
         return feature
 
-    cosine_gate_enabled = _env_flag("HIPAD_ACTIVATION_COSINE_GATE", True)
-    cosine_gate_low = float(os.environ.get("HIPAD_ACTIVATION_COSINE_GATE_LOW", "0.30"))
-    cosine_gate_high = float(os.environ.get("HIPAD_ACTIVATION_COSINE_GATE_HIGH", "0.60"))
+    cosine_gate_enabled = _env_flag("ACTIVATION_COSINE_GATE", True)
+    cosine_gate_low = float(os.environ.get("ACTIVATION_COSINE_GATE_LOW", "0.30"))
+    cosine_gate_high = float(os.environ.get("ACTIVATION_COSINE_GATE_HIGH", "0.60"))
     if cosine_gate_high <= cosine_gate_low:
         raise ValueError(
-            "HIPAD_ACTIVATION_COSINE_GATE_HIGH must be greater than "
-            "HIPAD_ACTIVATION_COSINE_GATE_LOW."
+            "ACTIVATION_COSINE_GATE_HIGH must be greater than "
+            "ACTIVATION_COSINE_GATE_LOW."
         )
 
     # The rank-3 call is the original align_query hook. It is reached once at
@@ -203,7 +203,7 @@ def _apply_hipad_activation(name, feature, layer_index, num_layers):
             gate = gate.reshape(feature.shape[0], *([1] * (feature.ndim - 1)))
             gates[cache_key] = gate
             injector._hipad_layer0_cosine_gates = gates
-            if _env_flag("HIPAD_ACTIVATION_COSINE_GATE_VERBOSE"):
+            if _env_flag("ACTIVATION_COSINE_GATE_VERBOSE"):
                 print(
                     "[HiP-AD cosine gate] "
                     f"key={cache_key}, "

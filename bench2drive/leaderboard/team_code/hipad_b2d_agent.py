@@ -315,7 +315,7 @@ class SparseAgent(autonomous_agent.AutonomousAgent):
         self.prev_control = control
         self.prev_control_cache = []
 
-        self.is_visualize = False
+        self.is_visualize = True
         self.visualize_interval = 1
 
         if self.is_visualize:
